@@ -1,0 +1,597 @@
+package com.sbi.fxout.cron;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.env.Environment;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import com.sbi.fxout.dao.SQLConstants;
+import com.sbi.fxout.service.FxoutSendMercuryWriterService;
+
+import net.javacrumbs.shedlock.core.SchedulerLock;
+
+
+@Component("fxoutMercuryInitiateCron")
+public class FxoutMercuryInitiateCron {
+	
+	@Autowired
+    Environment env;
+	
+	public final static Logger logger =  LogManager.getLogger(FxoutMercuryInitiateCron.class);
+	
+	
+	@Autowired
+	FxoutSendMercuryWriterService fxoutmercurySendService;
+	
+	@Scheduled(fixedDelay = 1200000)
+	@SchedulerLock(name = "taskScheduler", lockAtMostFor = 60000L, lockAtLeastFor = 60000L)
+	public void postToBeneficiary() {
+		logger.info("=================FxoutMercuryInitiateCron=====> =================");
+		
+
+		try {
+			//System.out.println("FxoutMercuryInitiateCron.postToBeneficiary()");
+			final String isServiceEnable = env.getRequiredProperty("ENABLE_FXOUT");
+			if(isServiceEnable.equalsIgnoreCase("Y")){
+				fxoutmercurySendService.sendMercuryRequest();
+			}else{
+				logger.info( "FxoutMercuryInitiateCron isServiceEnable ==="+isServiceEnable);
+			}
+		} catch (Exception e) {
+			e.printStackTrace();
+			logger.info(e.getMessage());
+		}
+		logger.info("FxoutMercuryInitiateCron.postToBeneficiary():: ended");
+
+	}
+
+}
+
+package com.sbi.fxout.service;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Properties;
+
+import javax.annotation.Resource;
+
+import org.apache.logging.log4j.LogManager;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.PropertySource;
+import org.springframework.context.annotation.PropertySources;
+import org.springframework.core.env.Environment;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sbi.fxout.dao.FxoutMercuryWriterDao;
+import com.sbi.fxout.model.FxoutMercuryModel;
+
+@Service
+@PropertySources({
+	@PropertySource("classpath:application.properties")
+})
+public class FxoutSendMercuryWriterServiceImpl implements FxoutSendMercuryWriterService {
+
+	public final static org.apache.logging.log4j.Logger logger =  LogManager.getLogger(FxoutSendMercuryWriterServiceImpl.class);
+
+
+	
+	@Autowired
+	private RestTemplate template;
+	@Autowired
+	@Resource
+	private Environment env;
+	@Autowired
+	private FxoutSendMercuryWriterServiceImpl service;
+	String url;
+	@Autowired
+	private  FxoutMercuryWriterDao fxoutMercuryWriterDao;
+	List<String> pans=new ArrayList<>();    
+	
+	@Override
+	public FxoutMercuryModel sendMercuryRequest() throws Exception {
+		///System.out.println("FxoutSendMercuryWriterServiceImpl.sendMercuryRequest()");
+		
+		//env1=env;
+		//String url1 = env.getRequiredProperty("mercury_url");
+		//String ticket=env.getRequiredProperty("mercury_ticket");
+	//url=url1;
+		 //channel = env.getRequiredProperty("mercury_channel");
+		logger.info("FxoutSendMercuryWriterServiceImpl.sendMercuryRequest() ::started    Pan Restrict");
+            FxoutMercuryModel model1=null;
+		//try {
+			///System.out.println("a1");   
+			logger.info("Inside sendMercuryRequest method Begins Akshay");
+			
+			List<FxoutMercuryModel> fetchRecords = fxoutMercuryWriterDao.fetchRecords();
+			///System.out.println("fetchRecords====" + fetchRecords);
+			if (fetchRecords != null && fetchRecords.size() > 0) {
+				
+				pans = fxoutMercuryWriterDao.fetchPan();
+				
+				
+				ListIterator<FxoutMercuryModel> iterator = fetchRecords.listIterator();
+				List<FxoutMercuryModel> lst = new ArrayList<FxoutMercuryModel>();
+				while (iterator.hasNext()) {
+					FxoutMercuryModel next = iterator.next();
+					lst.add(next);
+				}
+				ListIterator<FxoutMercuryModel> itr = lst.listIterator();
+				
+				while (itr.hasNext()) {
+
+					FxoutMercuryModel model = itr.next();			
+					String request = model.getRequest();
+					
+					 ObjectMapper mapper=new ObjectMapper();
+					  HashMap<String,String> mp = mapper.readValue(request, HashMap.class);    
+					  String pan_no = "";
+					  
+					 pan_no = mp.get("pan_number");
+					 String lrs_Token_id = mp.get("lrs_tcs_tokenid");
+					
+					logger.debug("total  pan no ..."+pans.size());
+					logger.debug("current pan no ..."+pan_no);
+					logger.debug("current txn no ..."+model.getRefNo());
+					logger.debug("current lrs_tcs_tokenid ..."+lrs_Token_id);
+					
+					if(lrs_Token_id.trim().length()==0){
+						logger.debug("The txn for reference no "+model.getRefNo()+" is of NRE type and no SAME PAN condition is to be checked for this");
+						model1 = service.process(model);
+					}
+					
+					if(lrs_Token_id.trim().length()>0){
+						
+						logger.debug("LRS Token ID is present indicates the transaction is of NON NRE and hence the SAME PAN condition is to be checked");
+					
+					if(pan_no == null || !pans.contains(pan_no)){
+					   model1 = service.process(model);
+					}
+					else{
+						fxoutMercuryWriterDao.updateRemarks(mp.get("branch_ref_no"),mp.get("pan_number"));
+					}
+					}
+					
+				}
+			} else {
+				///System.out.println("LIST IS EMPTY");
+				logger.debug("==============refList is empty===========");
+			}
+
+			
+			logger.info("FxoutSendMercuryWriterServiceImpl.sendMercuryRequest() ::End");
+		/*} catch (Exception e) {
+			e.printStackTrace();
+			
+		} */
+
+		return model1;
+	}
+
+	@SuppressWarnings("unchecked")
+	public  FxoutMercuryModel process(FxoutMercuryModel model) throws Exception {
+		logger.info("process Started::" + model.getRefNo());
+		
+		String response = null;
+		// FxoutMercuryModel model=new FxoutMercuryModel();
+
+
+		//RestTemplate restTemplate1 = new RestTemplate();
+		Properties p=null;
+		//String url=null;
+		//try{
+			//logger.info("inside try  before properties...");
+			logger.info("inside try  before properties123454");
+		// p=new Properties();
+		//p.load(new FileInputStream("/WEB-INF/classes/application.properties"));
+		 
+		
+			logger.info("environment  "+env);
+		 url = env.getRequiredProperty("mercury_url");
+		 
+		logger.info("URL::"+url);
+		/*}catch(Exception e){
+			logger.info("in property file exception...",e);
+		}*/
+		 
+		 HttpHeaders headers1 = new HttpHeaders();
+		 
+		headers1.add("_ticket", env.getRequiredProperty("mercury_ticket"));
+		headers1.add("_channel",env.getRequiredProperty("mercury_channel"));
+		
+		
+		
+		logger.info("Request::" + model.getRequest());
+		
+		
+		try{
+		//template=null;
+		HttpEntity<String> requestEntity = new HttpEntity<>(model.getRequest(), headers1);
+		
+		
+		
+		
+		
+		//try {
+			 response = template.postForObject(url, requestEntity, String.class);
+			 
+			 
+			 
+			    
+			///response="{\"status\":\"success\", \"message\":\"Processing for the FXOUT Transaction started in Mercury. Please call Status Enquiry API to get status and response of the transaction.\", \"status_code\":\"02\", \"batch_no\":\"FXOUT0000027948\", \"branch_ref_no\":\"0111123TS1007839\"}";
+			 //response="{\"status\":\"success\", \"message\":\"Processing for the transaction started in Mercury.\", \"status_code\":\"03\"}";
+			//// response= "{\"status\":\"success\", \"message\":\"Processing for the Transaction started in Mercury. Please call Status Enquiry API to get status and response of the transaction.\", \"status_code\":\"02\"}";
+			 
+			 fxoutMercuryWriterDao.updateCreditDetails(model.getRefNo());
+			 
+			 logger.info("RESPONSE::" + response);
+			
+			 ObjectMapper mapper=new ObjectMapper();
+			  HashMap<String,String> mp = mapper.readValue(response, HashMap.class);            
+			  HashMap<String,String> mp1 = mapper.readValue(model.getRequest(), HashMap.class);            
+				
+			  String pan_no = mp1.get("pan_number");
+			pans.add(pan_no);
+			//model.setRequest(request);
+			logger.info("status : "+mp.get("status_code")+"   "+mp.get("message"));
+			model.setStatus_code(mp.get("status_code")); // 00
+			model.setMessage(mp.get("message")); // Processing for the
+				model.setResponse(response);									// transaction started in
+											// Mercury.
+			model.setStatus(mp.get("status")); // success
+			
+		/*} catch (Exception e) {
+		 logger.info("exception came..."+e.getMessage());
+			//model.setStatus("failure");
+		}*/
+
+		
+		if (!"".equalsIgnoreCase(model.getStatus_code())) {
+			logger.info("status code :::"+model.getStatus_code());
+			// update response data in mercury api table
+			//fxoutMercuryWriterDao=new  FxoutMercuryWriterDaoImpl();
+			fxoutMercuryWriterDao.updateMercuryReqRes(model, response);
+		}
+
+		}catch(Exception exe){
+			logger.debug("Exception occour :: "+ exe);
+			logger.debug("Exception occour :: "+ exe.getMessage());
+		}
+
+		logger.info(" process end Mercury Response::" + response);
+		return model;
+
+	}
+
+}
+
+package com.sbi.fxout.dao;
+
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.Arrays;
+import java.util.List;
+
+import org.apache.logging.log4j.LogManager;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.stereotype.Repository;
+
+import com.sbi.fxout.model.FxoutMercuryModel;
+
+@Repository
+public class FxoutMercuryWriterDaoImpl implements FxoutMercuryWriterDao {
+	public final static org.apache.logging.log4j.Logger logger =  LogManager.getLogger(FxoutMercuryWriterDaoImpl.class);
+
+	List<FxoutMercuryModel> refList = null;
+
+
+	@Autowired
+	private JdbcTemplate jdbcTemplate;
+	
+	public void setJdbcTemplate(){
+		
+	}
+	
+	@Autowired
+	FxoutMercuryWriterDao fxoutMercuryWriterDao;
+	
+	@Override
+	public List<FxoutMercuryModel> fetchRecords() throws Exception {
+		
+		logger.info("fetchRecords() started:");
+		
+			refList = jdbcTemplate.query(SQLConstants.FETCH_RECORDS_FOR_MERCURY,new ModelVal());
+			
+			
+			logger.info("sql query "+SQLConstants.FETCH_RECORDS_FOR_MERCURY);
+			
+			logger.info("fetchRecords() end:123456 "+refList.size());
+			
+			logger.info("fetchRecords() value "+refList.toString());
+		 
+		return refList;
+	}
+
+	class ModelVal implements RowMapper<FxoutMercuryModel> {
+
+		@Override
+		public FxoutMercuryModel mapRow(ResultSet rs, int arg1) throws SQLException {
+ 
+			FxoutMercuryModel model = new FxoutMercuryModel();
+			
+
+			model.setRefNo(rs.getString("REF_NO"));
+		
+			model.setRequest_type(rs.getString("REQUEST_TYPE"));
+			
+			model.setRequest(rs.getString("REQUEST"));
+			
+			return model;
+		}
+
+	}
+
+	
+	
+	public void updateMercuryReqRes(FxoutMercuryModel model,String response) throws Exception {
+		logger.info("updateMercuryReqRes(FxoutMercuryModel model,String response):: started222");
+		//JdbcTemplate jdbcTemplate2 = conf.jdbcTemplate();
+		//try {
+			logger.info("updateMercuryReqRes(FxoutMercuryModel model,String response)::  "+response+"  ttt "+model.getStatus_code());
+			int i=0;
+			//JdbcTemplate jdbcTemplate2 = FxoutMercuryWriterDaoImpl.jdbcTemplate();
+			if ("02".equalsIgnoreCase(model.getStatus_code().trim())) {
+				logger.info("inside 02 started");
+				model.setStatus("enquiry required");
+				model.setRequest("{"+"\"branch_ref_no\":\""+model.getRefNo()+"\""+"}");
+				Object[] params={model.getRefNo(),model.getRequest(),model.getStatus(),0,"MERCURY-ENQUIRY",model.getStatus_code()};
+				int update = jdbcTemplate.update(SQLConstants.INSERT_MERCURY_API_REQUEST,params);
+				logger.info("inside 02 ended : "+update+" row updated");
+			
+			} 
+			else if ("00".equalsIgnoreCase(model.getStatus_code().trim())) {
+				model.setStatus("success");
+				/*Object[] params = {response,model.getStatus_code(),model.getStatus(), model.getRefNo(),"MERCURY"};
+				 i=jdbcTemplate2.update(SQLConstants.UPDATE_MERCURY_RESPONSE, params);
+	            */
+			} 
+			
+			else {
+				logger.info("else part...");
+				model.setStatus("failure");
+				/*Object[] params = {response,model.getStatus_code(),model.getStatus(), model.getRefNo(),"MERCURY"};
+				 i=jdbcTemplate2.update(SQLConstants.UPDATE_MERCURY_RESPONSE, params);
+	            */
+			}
+			Object[] params = {response,model.getStatus_code(),model.getStatus(), model.getRefNo(),"MERCURY"};
+			
+			i=jdbcTemplate.update(SQLConstants.UPDATE_MERCURY_RESPONSE, params);
+			
+			
+			
+		/*} catch (Exception e) {
+			logger.info("issue came :: "+e.getMessage());
+			System.out.println("issue");
+			e.printStackTrace();
+		}*/
+	}
+	
+	
+	public void updateCreditDetails(String refNo) throws Exception
+	{
+		logger.info("==============Inside updateCreditDetails Begin=============");
+		
+			Object param[] ={"write_mercury_file","fxo_mer_swift",refNo};
+			jdbcTemplate.update(SQLConstants.UPDATE_MERCURY_WRITER,param);			
+			
+			Object param2[]={"mc_wait",refNo};
+			jdbcTemplate.update(SQLConstants.UPDATE_CREDIT_STATUS_MERCURY,param2);
+			//BatchSqlUpdate creditDetails = new BatchSqlUpdate(getDataSource(),SQLConstants.UPDATE_CREDIT_STATUS_MERCURY);			
+			
+			jdbcTemplate.update(SQLConstants.UPDATE_CUSTOMER_PAYMENT_PRESENTSTATUS,param2);
+			
+			
+			logger.info("==============ref no============="+refNo);
+			
+			logger.info("==============Inside updateCreditDetails End=============");
+		
+		
+	}
+
+
+	@Override
+	public List fetchPan() throws Exception {
+		
+		logger.info("==============Inside fetchPan() Begin=============");
+		
+		
+		Object[] param={"02","MERCURY-ENQUIRY"};
+		
+		List<String> pans = jdbcTemplate.query(SQLConstants.FETCH_PAN_FOR_RESTRICT,param,new FetchPanRowMapper());
+		logger.info("==============Inside fetchPan() End =============");
+		return pans;
+	}
+class FetchPanRowMapper  implements RowMapper<String>
+{
+
+	@Override
+	public String mapRow(ResultSet rs, int arg1) throws SQLException {
+		
+		String pan=rs.getString("REM_PAN_NO");
+		return pan;
+	}
+	
+}
+	public int updateRemarks(String refNo,String panNo) throws Exception {
+		logger.info("==============Inside updateRemarks(String refNo) Begin=============");
+		String remarks = "waitfor_pan_response_for ".concat(panNo);
+		Object[] param={remarks,refNo,"MERCURY"};
+		logger.info("param in updateRemarks(-): "+Arrays.toString(param));
+		int update = jdbcTemplate.update(SQLConstants.UPDATE_REMARKS_FOR_PAN,param);
+		logger.info("==============Inside updateRemarks(String refNo) End============="+update);
+		return update;
+	}
+}
+
+package com.sbi.fxout.dao;
+
+public interface SQLConstants {
+
+ 
+	public static final String insertdetails="SELECT cust.TXN_REF_NO,cust.TCS_AMOUNT FROM Fxout_Customer_Payment cust,  FXOUT_CREDIT_DETAILS credit,  fxout_remitter_master remi,  Fxout_Statement_Msgs_Content msgs,  fxout_test_status tstat  WHERE credit.status = 'refund_pending' AND cust.present_status = 'refund_pending_process' AND cust.status = 'refund_pending' AND cust.txn_ref_no     = credit.related_ref_no AND tstat.REFERENCE_NO  =cust.txn_ref_no  AND remi.rem_ref_no =cust.rem_ref_no AND Msgs.I61_Reference  =cust.txn_ref_no AND msgs.I61_DCMARK like 'C%' AND tstat.WORKFLOW_ID   ='fxo_mer_swift' AND tstat.TEST_NAME     ='write_daMercury_file' AND cust.Txn_Ref_No IN    (SELECT reference_no  FROM wac_reference_status  WHERE workflow_id=?  AND step_id =?  )";
+	public static final String FETCH_RECORDS_FOR_MERCURY="select REF_NO ,REQUEST_TYPE,REQUEST "
+			                                                + "from  FXOUT_MERCURY_REQ_RES "
+			                                                 +" where STATUS='PENDING' AND REQUEST_TYPE='MERCURY'";
+	
+	public static final String UPDATE_MERCURY_RESPONSE="UPDATE FXOUT_MERCURY_REQ_RES SET RESPONSE=?,RESPONSE_TIME=SYSDATE,STATUS_CODE=? ,STATUS=?,remarks='' WHERE REF_NO=? AND REQUEST_TYPE=?";
+	public static final String UPDATE_CREDIT_STATUS_MERCURY = "UPDATE FXOUT_CREDIT_DETAILS credit " +
+			" SET STATUS = ?, LAST_MOD_TIME=SYSDATE,LAST_MOD_BY = '*system'" +
+			//" , IRC_EX_RATE = 1 " +
+			" WHERE credit.RELATED_REF_NO = ? " +
+			"  and credit.status<>'reset'";
+	
+	 public static final String UPDATE_CUSTOMER_PAYMENT_PRESENTSTATUS = "UPDATE FXOUT_CUSTOMER_PAYMENT SET PRESENT_STATUS = ?" +
+             " ,LAST_MODIFIED_DATE = SYSDATE ,MODIFIED_BY = '*system' WHERE TXN_REF_NO = ?";
+
+	
+	 public static final String UPDATE_MERCURY_WRITER_REFUND = "update FXOUT_TEST_STATUS set status='success',MODIFIED_BY = '*system',LAST_MOD_DATE=sysdate where test_name=? "  //'write_daMercury_file'
+				+ "and WORKFLOW_ID=? and reference_no=?";       //'fxo_mer_swift'
+	 
+	
+	 public static final String UPDATE_CREDIT_STATUS_MERCURY1 = "UPDATE FXOUT_CREDIT_DETAILS credit " +
+				" SET STATUS = ?, LAST_MOD_TIME=SYSDATE,LAST_MOD_BY = '*system'" +
+				//" , IRC_EX_RATE = 1 " +
+				" WHERE credit.RELATED_REF_NO = ? " +
+				"  and credit.status = 'mc_refund_writing'";
+	
+	public static final String UPDATE_MERCURY_WRITER = "update FXOUT_TEST_STATUS set status='success',MODIFIED_BY = '*system',LAST_MOD_DATE=sysdate where test_name= ?" +//'write_mercury_file'
+				"and WORKFLOW_ID=? and reference_no=?";   //'fxo_mer_swift'
+	
+	public static final String FETCH_CONS_NO="select CONS_REF_NO from FLYWIRE_CUSTOMER_PAYMENT where TXN_REF_NO=?";
+	
+	public static final String FETCH_TXN_REF_NO="select TXN_REF_NO from FLYWIRE_CUSTOMER_PAYMENT where CONS_REF_NO=?";
+	 public static final String FETCH_TXN_REF_FOR_ENQUIRY="SELECT req.REF_NO,req.REQUEST FROM FXOUT_MERCURY_REQ_RES req WHERE req.STATUS_CODE=? AND req.STATUS='enquiry required' AND  REQUEST_TYPE=? AND trunc(req.CREATION_TIME) BETWEEN trunc(SYSDATE-5) and trunc(SYSDATE) ";// Updated with last 5 days records 
+	
+	 public static final String FETCH_TXN_REF="SELECT req.REF_NO,req.REQUEST FROM FXOUT_MERCURY_REQ_RES req "
+             + "WHERE req.STATUS_CODE=? AND trunc(req.CREATION_TIME) BETWEEN trunc(sysdate-5) and trunc(sysdate) AND req.STATUS='enquiry required' AND req.REQUEST_TYPE=? ";// Updated with last 5 days records
+	
+	public static final String UPDATE_TXN_DETAILS="UPDATE FXOUT_MERCURY_REQ_RES SET RESPONSE=?,RESPONSE_TIME=SYSDATE,STATUS_CODE=?,STATUS=?,ENQCNT=? WHERE REF_NO=? AND REQUEST_TYPE=?";
+	
+	 
+	public static final String GET_ENQ_COUNT="SELECT ENQCNT FROM FXOUT_MERCURY_REQ_RES WHERE REF_NO=? AND REQUEST_TYPE=?";
+	  public static final String GET_MER_ENQ_COUNT="SELECT ENQCNT FROM FXOUT_MERCURY_REQ_RES WHERE REF_NO=? AND REQUEST_TYPE=?";
+	  
+	           
+			public static final String  GET_TCS_AMT_AND_TXNREFNO="SELECT REF_NO,REQUEST FROM FXOUT_MERCURY_REQ_RES WHERE STATUS=? AND REQUEST_TYPE=?";
+	                                                                                
+	                                                                                     public static final String INSERT_MERCURY_API_REQUEST = "INSERT INTO FXOUT_MERCURY_REQ_RES (REF_NO, REQUEST, STATUS,ENQCNT,REQUEST_TYPE,STATUS_CODE,REQUEST_TIME,CREATION_TIME) values (?,?,?,?,?,?,SYSDATE,SYSDATE)";
+	public static final int TWENTY_MIN = 15 * 60 * 1000;
+	public static final int ONE_MIN = 15 * 60 * 1000;
+	public static final int THIRY_MIN = 30 * 60 * 1000;
+	public static final int FIVE_MIN = 5 * 60 * 1000;
+	public static final int THIRTY_SEC = 30 * 1000;
+	public static final int TWO_HR = 2 * 60 * 60 * 1000;
+	public static final int ONE_HR = 1 * 60 * 60 * 1000;
+	public static final int FIFTEEN_MIN = 15 *60 *1000;
+
+public static final String FETCH_DA_MERCURY_DETAILS = "select refno,REQUEST_STRING From IRC_MERCURY_REQUEST_RESPONSE Where STATUS= ? AND TRUNC(sysdate) BETWEEN TRUNC(sysdate-10) AND TRUNC(sysdate) and REQUEST_TYPE = ?  and rownum<900 ";// Updated with last 5 days records
+	
+	public static final String FETCH_MERCURY_ENQUIRY_DETAILS_DA = "select refno From IRC_MERCURY_REQUEST_RESPONSE Where STATUS=? and trunc(creation_time) between trunc(sysdate-10) and trunc(sysdate) and REQUEST_TYPE=?  and rownum<900 ";// Updated with last 5 days records
+	
+	public static final String FETCH_MERCURY_ENQUIRY_DETAILS_NON_DA = "select refno From IRC_MERCURY_REQUEST_RESPONSE Where STATUS=? and trunc(creation_time) between trunc(sysdate-10) and trunc(sysdate) and REQUEST_TYPE=?  and rownum<900 ";// Updated with last 5 days records
+	
+	
+	public static final String FETCH_NON_DA_MERCURY_DETAILS = "select refno,REQUEST_STRING From IRC_MERCURY_REQUEST_RESPONSE Where STATUS= ? AND TRUNC(sysdate) BETWEEN TRUNC(sysdate-10) AND TRUNC(sysdate) and  REQUEST_TYPE=?  and rownum<900 ";// Updated with last 5 days records
+	
+   public static final String Update_DA_Mercury_Status = "update IRC_MERCURY_REQUEST_RESPONSE  set STATUS=?,STATUS_CODE=?,RESPONSE_STRING=? where REFNO=? and  request_type = ?";
+	
+	public static final String Update_DA_Mercury_Status_failure = "update IRC_MERCURY_REQUEST_RESPONSE  set STATUS=?,STATUS_CODE=?,RESPONSE_STRING=? where REFNO=? and request_type = ?";
+	
+	public static final String INSERT_IRCENQ_MERCURY_API_REQUEST = "INSERT INTO IRC_MERCURY_REQUEST_RESPONSE (REFNO, REQUEST_STRING, STATUS,ENQ_COUNT,REQUEST_TYPE,STATUS_CODE,REQUEST_TIME,CREATION_TIME) values (?,?,?,?,?,?,SYSDATE,SYSDATE)";
+	public static final String Update_DA_Enquiry_Resposne = "update IRC_MERCURY_REQUEST_RESPONSE  set REQUEST_STRING=?,STATUS=?,STATUS_CODE=?,RESPONSE_STRING=?,RESPONSE_TIME=sysdate,ENQ_COUNT=(select ENQ_COUNT from IRC_MERCURY_REQUEST_RESPONSE where REFNO = ? And REQUEST_TYPE = ?)+1 where REFNO=? And REQUEST_TYPE = ?";
+    public static final String Update_MERCURY_RESPONSE_TIME  = "update IRC_MERCURY_REQUEST_RESPONSE set RESPONSE_TIME=sysdate where refno=?"; 
+    
+	public static final String Update_DA_Enquiry_Resposne_failure= "update IRC_MERCURY_REQUEST_RESPONSE  set REQUEST_STRING=?,STATUS=?,STATUS_CODE=?,RESPONSE_STRING=?,RESPONSE_TIME=sysdate,ENQ_COUNT=(select ENQ_COUNT from IRC_MERCURY_REQUEST_RESPONSE where REFNO = ? And REQUEST_TYPE = ?)+1 where REFNO=? And REQUEST_TYPE = ? and STATUS_CODE = ?";
+	
+	public static final String FETCH_RECORDS_FOR_FLYWIRE="SELECT REF_NO ,REQUEST_TYPE,REQUEST "
+			                                                + "from  FXOUT_MERCURY_REQ_RES "
+			                                                 +" where STATUS=? AND REQUEST_TYPE=? order by creation_time desc";
+	
+	public static final String UPDATE_FLYWIRE_CUSTOMER_PAYMENT_PRESENTSTATUS = "UPDATE FLYWIRE_CUSTOMER_PAYMENT SET PRESENT_STATUS = ?" +
+            " ,LAST_MODIFIED_DATE = SYSDATE ,MODIFIED_BY = '*system' WHERE TXN_REF_NO = ?";
+
+	
+	public static final String UPDATE_FLYWIRE_COMMISSION_STATUS="UPDATE FLYWIRE_CONS_TRANS_DTLS SET COMM_FLYWITRE=? WHERE FLYWIRE_COMMISSION_REF_NO= ?";
+	public static final String FETCH_TXNREF_FROMCUSTOMER = "SELECT REM_REF_NO,TOTAL_INR_AMOUNT,REM_OFAC FROM FLYWIRE_CUSTOMER_PAYMENT WHERE FLYWIRE_REF_NO =? ";
+	
+
+			public static final String FETCH_RECORDS_FOR_LRS_RETURN = "select to_char(sysdate,'dd-MM-yyyy HH:mm:ss'), cust.txn_ref_no,rem.rem_pan_no,cust.LRS_TOKEN_ID from  FLYWIRE_CUSTOMER_PAYMENT cust, FXOUT_REMITTER_MASTER rem where cust.REM_REF_NO = rem.REM_REF_NO and cust.lrs_return = 'post_req'  ";
+
+		public static final String INSERT_LRS_API_REQUEST = " Insert into FXOUT_MERCURY_REQ_RES (REF_NO,REQUEST_TYPE,REQUEST,REQUEST_TIME,STATUS,ENQCNT,CREATION_TIME) values (?,?,?,sysdate,?,0,sysdate) ";
+		public static final String UPDATE_STATUS_LRS_API_REQUEST = " Update FLYWIRE_CUSTOMER_PAYMENT set LRS_RETURN = ? where txn_ref_no = ? ";
+		public static final String FETCH_RECORDS_FOR_LRS_RETURN_API_REQUEST = "Select ref_no, request from FXOUT_MERCURY_REQ_RES where status = ? and REQUEST_TYPE = ? ";
+		public static final String GET_KYC_SEQUENCE = " select LPAD(KYC_SEQ_NO.NEXTVAL,8,'0') as GET_KYC_SEQUENCE from DUAL ";
+		public static final String LRS_RETURN_REQ_INSERTION = "INSERT INTO FXOUT_EIS_AUDIT (REQ_REF_NO,REQUEST_TYPE,REQUEST,REQUEST_TIME) VALUES(?,?,?,sysdate)";
+		public static final String FXOUT_RETURN_RES_UPDATION = "UPDATE FXOUT_EIS_AUDIT SET RESPONSE = ?,RESPONSE_TIME = SYSDATE WHERE REQ_REF_NO = ? ";
+		
+		public static final String FXOUT_RETURN_RESP_UPDATE_TXN_TABLE = "UPDATE FLYWIRE_CUSTOMER_PAYMENT set LRS_RETURN = ? where TXN_REF_NO = ?";
+		
+		public static final String FXOUT_RETURN_MERCURY_UPDATE_TXN_TABLE = "UPDATE FXOUT_MERCURY_REQ_RES set STATUS = ?,response=? where REF_NO = ? and REQUEST_TYPE='LRS_RETURN' ";
+		public static final String FETCH_RECORDS_FOR_FLYWIRE_API_RETURN = " Select FLYWIRE_REF_NO, REM_REF_NO,TOTAL_INR_AMOUNT,TRAN_FC_TYPE,REM_OFAC from FLYWIRE_CUSTOMER_PAYMENT where (status = ? or rem_ofac = ?) and FLYWIRE_RETURN = ? ";
+		public static final String UPDATE_STATUS_FLYIRE_API_REQUEST = "Update FLYWIRE_CUSTOMER_PAYMENT set FLYWIRE_RETURN = 'Y' where FLYWIRE_REF_NO = ? ";
+		public static final String FETCH_RECORDS_FOR_FLYWIRE_RETURN_API_REQUEST = " Select ref_no, request from FXOUT_MERCURY_REQ_RES where status = ? and REQUEST_TYPE = ? ";
+		public static final String UPDATE_STATUS_FOR_FLYWIRE_RETURN_API = "UPDATE FLYWIRE_CUSTOMER_PAYMENT set FLYWIRE_RETURN = ? where FLYWIRE_REF_NO = ? and FLYWIRE_RETURN = ?  ";
+		public static final String UPDATE_STATUS_FOR_FLYWIRE_RETURN_MER_API = " UPDATE FXOUT_MERCURY_REQ_RES set status = ? ,RESPONSE=?,RESPONSE_TIME=SYSDATE where ref_no = ? and status = ? ";
+
+		public static final String FETCH_PAN_FOR_RESTRICT  =" select a.REM_PAN_NO from "+
+				 " FXOUT_REMITTER_MASTER a, "+
+				 " fxout_customer_payment b ,FXOUT_MERCURY_REQ_RES c " +
+				 " WHERE trunc(c.CREATION_TIME)  BETWEEN trunc(sysdate-7) "+
+				 " and trunc(sysdate)  "+
+				 " and  c.STATUS_CODE =? and a.REM_REF_NO=b.REM_REF_NO and b.TXN_REF_NO=c.REF_NO and c.REQUEST_TYPE=?"+
+				 " and b.LRS_TOKEN_ID is not null ";
+		
+		public static final String UPDATE_REMARKS_FOR_PAN  = "UPDATE FXOUT_MERCURY_REQ_RES SET REMARKS=? where ref_no=? AND STATUS='PENDING' and request_type=?";
+		
+		
+		public static final String FETCH_RECORDS_FOR_LRS_TCS_CONFIRMATION = "select cp.LRS_TOKEN_ID as tokenId,to_char(sysdate,'dd-MM-yyyy HH:mm:ss')as requestTime,cp.TRAN_AMOUNT_USD as usdEquivalent,cp.INR_SUB_TOTAL as inrEquivalent,cp.TXN_REF_NO as transId,cp.TRAN_FC_AMOUNT as trnAmount,cp.TRAN_FC_TYPE as orgCurCode,to_char(cp.CREATION_DATE,'yyyyMMdd')as trnDate,to_char(cp.CREATION_DATE,'yyyyMMdd')as valDate,rm.REM_CIF_CODE as cifNo,"
+                                                                           +"rm.REM_ACC as accNo,ben.DESTINATION_COUNTRY as cntryCode,rm.REM_NME as custName "
+                                                                           +"FROM FLYWIRE_CUSTOMER_PAYMENT cp,FXOUT_REMITTER_MASTER rm,FXOUT_FLYWIRE_BEN_DETAILS ben "
+                                                                           +"WHERE cp.REM_REF_NO=rm.REM_REF_NO AND cp.TRAN_FC_TYPE=ben.FC_CURRENCY AND PRESENT_STATUS =? AND STATUS=? ";
+		
+		public static final String UPDATE_STATUS_FOR_LRS_TCS_CONFIRMATION ="update FLYWIRE_CUSTOMER_PAYMENT set PRESENT_STATUS =?, STATUS= ? where TXN_REF_NO=? and STATUS=? ";
+		
+		public static final String UPDATE_LRS_API_REQUEST = "UPDATE FXOUT_MERCURY_REQ_RES set STATUS = ?,response=?,RESPONSE_TIME=sysdate,STATUS_CODE=? where REF_NO = ? and REQUEST_TYPE=? ";
+		
+		public static String GET_TRANS_SEQ_NUMBER_For_Flywire = "SELECT '01111'||TO_CHAR(SYSDATE, 'YY')||'TSF'||LPAD(FXOUT_TRAN_SEQ.NEXTVAL,6,'0') AS SEQNUMBER FROM DUAL";
+		
+		public static final String INSERT_INTO_FLYWIRE_FXOUT_TEST_STATUS = "insert into FXOUT_TEST_STATUS(TEST_NAME,REFERENCE_NO,STATUS,WORKFLOW_ID,INITIATED_TIME )"
+				+ "select distinct LAST_EVENT,?,'pending','flywire_validation',sysdate from WAC_FLOW_CONTROL_MASTER "
+				+ " where WORKFLOW_ID='flywire_validation'  and WORKFLOW_ID in (?) ";
+		
+		public static final String UPDATE_FLYWIRE_START_STEP_INTO_TEST_STATUS = "update FXOUT_TEST_STATUS set status='success' where test_name='flywire_trans_start_steps' and reference_no=?";
+ 
+		public static final String FETCH_RECORDS_FOR_FTC="select REF_NO ,REQUEST_TYPE,REQUEST "
+                + "from  FXOUT_MERCURY_REQ_RES "
+                 +" where STATUS='PENDING' AND REQUEST_TYPE='FTC'";
+		
+		public static final String FETCH_PAN_FOR_RESTRICT_FTC  =" select a.REM_PAN_NO from "+
+				 " FXOUT_REMITTER_MASTER a, "+
+				 " fxout_ftc_customer_payment b ,FXOUT_MERCURY_REQ_RES c " +
+				 " WHERE trunc(c.CREATION_TIME)  BETWEEN trunc(sysdate-7) "+
+				 " and trunc(sysdate)  "+
+				 " and  c.STATUS_CODE =? and a.REM_REF_NO=b.REM_REF_NO and b.TXN_REF_NO=c.REF_NO and c.REQUEST_TYPE=?"+
+				 " and b.LRS_TOKEN_ID is not null ";
+		
+		 public static final String UPDATE_FTC_CUSTOMER_PAYMENT_PRESENTSTATUS = "UPDATE fxout_ftc_customer_payment SET PRESENT_STATUS = ?" +
+	             " ,LAST_MODIFIED_DATE = SYSDATE ,MODIFIED_BY = '*system' WHERE TXN_REF_NO = ?";
+}
