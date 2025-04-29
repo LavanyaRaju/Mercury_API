@@ -1,0 +1,1378 @@
+package com.sbi.fxout.cron;
+
+
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.env.Environment;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import com.sbi.fxout.dao.SQLConstants;
+import com.sbi.fxout.service.FlywireLRSReturnService;
+
+import net.javacrumbs.shedlock.core.SchedulerLock;
+
+@Component
+public class FlywireLrsCronJob {
+	
+public final static Logger logger =   LogManager.getLogger(FxoutMercuryInitiateCron.class);
+
+@Autowired
+FlywireLRSReturnService flywireLRSReturnService;
+@Autowired
+Environment env;
+
+@Scheduled(fixedDelay = 600000)
+@SchedulerLock(name = "taskScheduler", lockAtMostFor = SQLConstants.TWENTY_MIN, lockAtLeastFor = SQLConstants.TWENTY_MIN)
+   public void returnLRSForFlywireTxn(){
+	logger.info("returnLRSForFlywireTxn METHOD BEGIN");
+	System.out.println("returnLRSForFlywireTxn METHOD BEGIN");
+	try {
+		final String isServiceEnable = env.getRequiredProperty("ENABLE_FLYWIRE_LRS");
+		if(isServiceEnable.equalsIgnoreCase("Y")){
+		flywireLRSReturnService.callLRSReturnAPI();
+	}else{
+		logger.info( "MFlywireLRSReturnCron isServiceEnable ==="+isServiceEnable);
+	}
+	} catch (Exception e) {
+		e.printStackTrace();
+		logger.info(e.getMessage());
+	}
+	logger.info("FxoutMercuryInitiateCron.postToBeneficiary():: ended");
+	
+}
+@Scheduled(fixedDelay = 300000)
+   public void lrsTcsConfirmationCron(){
+	logger.info("lrsTcsConfirmationCron METHOD BEGIN");
+	try {
+		final String isServiceEnable = env.getRequiredProperty("ENABLE_FLYWIRE_LRS_TCS_CON");
+		if(isServiceEnable.equalsIgnoreCase("Y")){
+			flywireLRSReturnService.sendTxnInfoToLrsTcsConfirmation();	
+		}else{
+			logger.info("lrsTcsConfirmationCron METHOD ENABLE_FLYWIRE_LRS_TCS_CON disable "+isServiceEnable);
+		}
+		
+	} catch (Exception e) {
+		e.printStackTrace();
+		logger.info("Exception in lrsTcsConfirmationCron "+e.getMessage());
+	}
+	logger.info("lrsTcsConfirmationCron :: ended");
+	
+}
+}
+
+package com.sbi.fxout.service;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.net.SocketTimeoutException;
+import java.net.URL;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Properties;
+import java.util.concurrent.TimeUnit;
+
+import javax.annotation.Resource;
+import javax.servlet.ServletContext;
+
+import org.apache.commons.lang.StringUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.json.JSONObject;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.PropertySource;
+import org.springframework.context.annotation.PropertySources;
+import org.springframework.core.env.Environment;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
+import org.springframework.web.servlet.mvc.multiaction.MultiActionController;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.sbi.fxout.dao.FlywireLRSReturnDao;
+import com.sbi.fxout.dao.SQLConstants;
+import com.sbi.fxout.model.FlywireLRSReturnModel;
+import com.sbi.fxout.model.LrsTcsConfirmationReq;
+import com.sbi.fxout.utility.StringConstant;
+
+import in.co.sbi.idea.services.crypto.CryptoService;
+import in.co.sbi.idea.services.crypto.CryptoServiceImpl;
+import okhttp3.Authenticator;
+import okhttp3.Credentials;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
+import okhttp3.Route;
+
+
+@Service
+@PropertySources({
+	@PropertySource("classpath:application.properties")
+})
+public class FlywireLRSReturnServiceImpl extends  MultiActionController implements FlywireLRSReturnService {
+	
+	public final static org.apache.logging.log4j.Logger logger =  LogManager.getLogger(FxoutSendMercuryWriterServiceImpl.class);
+	@Autowired
+	private RestTemplate template;
+    @Autowired 
+    FlywireLRSReturnDao flywireLRSReturnDao;
+    @Autowired
+	@Resource
+	private Environment env;
+    /*@Autowired
+    RESTUtility restUtility;*/
+    @Autowired
+    ResourceLoader resourceLoader;
+    @Autowired
+    private ServletContext servletContext;
+    
+	@Override
+	public void callLRSReturnAPI() {
+		logger.debug("FlywireLRSReturnServiceImpl:: callLRSReturnAPI METHOD BEGIN");
+		
+		FlywireLRSReturnModel model1=null;
+		
+		List<FlywireLRSReturnModel> fetchRecords = flywireLRSReturnDao.fetchRecords();
+		logger.debug("Size of FlywireLRSReturnModel List is  :: "+fetchRecords.size());
+		
+		if (fetchRecords != null && fetchRecords.size() > 0) {
+			generateLRSReturnRequest(fetchRecords);
+			
+		}
+		sendLRSReturnRequest();
+	}
+
+	private void sendLRSReturnRequest() {
+		
+		logger.debug("FlywireLRSReturnServiceImpl:: sendLRSReturnRequest METHOD BEGIN");
+		
+		List<FlywireLRSReturnModel> fetchRecordsToSendRequest = flywireLRSReturnDao.fetchLRSReturnReqRecords();
+		Iterator iterator = fetchRecordsToSendRequest.iterator();
+		
+		while (iterator.hasNext()) {
+			FlywireLRSReturnModel model = (FlywireLRSReturnModel)iterator.next();
+			
+			processRequest(model);
+			
+		}
+			
+		}
+
+	private void processRequest(FlywireLRSReturnModel model) {
+		try{
+		logger.debug("processRequest METHOD BEGIN");
+		String response = null;
+		
+		Properties urlPath = null;
+		urlPath = new Properties();
+		
+		String realPath2 = getServletContext().getContextPath();
+		
+		HashMap<String, String> lrsTcsParamHm = encyAlgoMapping();
+		
+		//Resource resource = (Resource) resourceLoader.getResource("classpath:/lrsTcsApi/jks");
+					
+		Calendar calendar = Calendar.getInstance();
+		int mydayvar = calendar.get(Calendar.DAY_OF_YEAR);
+		DateFormat df = new SimpleDateFormat("yyyy");
+		DateFormat df1 = new SimpleDateFormat("hhMMsss");
+		String year = df.format(Calendar.getInstance().getTime());
+		String time = df1.format(Calendar.getInstance().getTime());
+		
+//		logger.info("FetchTCSDetails Params11  : "+lrsFilePath);	
+		DateTimeFormatter dtf = DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss.SS");
+		LocalDateTime now = LocalDateTime.now();
+		String format = dtf.format(now);
+		try{
+		
+		String s1 = "" + StringUtils.leftPad(Integer.toString(mydayvar),3,"0")+""+time;			
+		
+		//String branch_no = (String)session.getAttribute("branchNumber");
+//		logger.info("FetchTCSDetails Params  : "+lrsFilePath);		
+   		//Hit Service
+   			   		
+		String source_id = "FXOUT";		
+		
+		
+			
+			String requestId = s1 + getKycSequenceNo();
+			logger.info("requestId  "+requestId);		
+			
+			Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+			
+			logger.info("gson request  "+gson);		
+			
+			
+			model.setRequestId(requestId);
+			model.setSrcSystem(source_id);
+			
+			ObjectMapper mapper=new ObjectMapper();
+			HashMap map = mapper.readValue(model.getRequest(),HashMap.class);
+			
+			String pan = (String) map.get("panNo");
+			String token =(String) map.get("tokenId");
+			String transId = (String) map.get("transId");
+			String req_time = (String) map.get("requestTime");
+			model.setTokenId(token);
+			model.setPanNo(pan);
+			model.setTransId(model.getRefNo());
+			model.setRequestTime(format);
+			
+			String tcsReqParamsJsonStr = gson.toJson(model);
+			logger.info("LRS Return Request is ::" + model.toString());
+			logger.info("LRS Return Request is ::" + tcsReqParamsJsonStr.toString());
+			CryptoService encService = CryptoServiceImpl.getInstance();
+			String encryptedData = encService.encrypt(tcsReqParamsJsonStr, lrsTcsParamHm);
+			
+			
+			if (encryptedData != null)
+	   			{
+				EncryptedData encryptedRequest = gson.fromJson(encryptedData, EncryptedData.class);
+				logger.info("LRSRetrun tcsReqParams encryptedRequest JSON::" + encryptedRequest.toString());	
+				
+				if(encryptedRequest.isSuccess())
+	   				{
+ 	   				String lrsRetrunUrl = env.getRequiredProperty("idea_fetchTCSDetails");	//TO_CHECK 	
+ 	   			logger.info("LRSReturn LRSReturn ::" + lrsRetrunUrl);
+	 				
+	 				String finalTcsRequest = new String(""
+	 						+ "{\"requestId\":\""+requestId+"\","
+	 						+ "\"srcSystem\":\""+source_id+"\","				 						
+	 						+ "\"requestedData\":\""+ encryptedRequest.getData()+"\","
+	 						+ "\"signature\":\""+encryptedRequest.getSign() +"\"}"
+	 						);
+	 				String encAesKey = encryptedRequest.getEncAesKey();
+	 								 				
+	 				byte[] plainAesByte = encryptedRequest.getPlainAesKey(); 
+	 				//byte[] plainAesByte = new byte[splitAesKey.length]; 
+	 				//for(int i = 0; i < splitAesKey.length; i++)
+	 				//{
+	 				//	plainAesByte[i] = (byte) Integer.parseInt(splitAesKey[i].replaceAll("\\[", "").replaceAll("\\]",""));
+	 				//}
+	 								 				
+				 	model.setRequest(finalTcsRequest + 
+				 			"{\"encAesKey\":\""+encAesKey+"\"\","
+				 			+"\"plainAesKey\":\""+new String(plainAesByte)+"\"}");							 	
+				 	model.setRequestType("LRS_FLYWIRE_RETURN");
+				 	//model.setRefNo(requestId);
+				 	flywireLRSReturnDao.insertLRSReturnRequest(model);
+				 	logger.info("After insert ");
+				 	logger.info("After insert123 ");
+		 			try{
+		 				logger.info("inside try...");
+		 				logger.info("new Deployment...");
+				 	
+		 				RESTUtility restUtility=new RESTUtility();//getUtility();
+		 				
+				 	logger.info("lrsRetrunUrl::::"+lrsRetrunUrl+"    finalTcsRequest::::"+finalTcsRequest+"   encAesKey::::"+encAesKey);
+				 	String tcsReturnOutput = restUtility.post(lrsRetrunUrl, finalTcsRequest, encAesKey);	
+				 	
+				 	///String tcsReturnOutput="{\"data\":\"{\\\"requestId\\\":\\\"270040901800255751\\\",\\\"responseTime\\\":\\\"27-09-202316:25:26\\\",\\\"panNo\\\":\\\"DTAPK2764K\\\",\\\"status\\\":0,\\\"revarsalAmount\\\":70.0}\",\"sign\":\"\",\"encAesKey\":\"\",\"plainAesKey\":null,\"success\":true,\"error\":\"\"}";
+				 	
+				 	                         
+				 	
+				 //	logger.info("LRS Return TCS output from IDEA AFTER POSTING::" + tcsReturnOutput);				 		        
+				 	model.setResponse(tcsReturnOutput);
+				 	flywireLRSReturnDao.updateLRSResponse(model);
+				 	if(tcsReturnOutput != null)
+				 	{
+				 		RCLTSEncResponse tcsResp = gson.fromJson(tcsReturnOutput, RCLTSEncResponse.class);
+				 		String responseData = tcsResp.getResponseData();
+				 		String signature = tcsResp.getSignature();
+				 		logger.info("FetchTCSDetails TCS output from IDEA responseData::" + tcsResp.toString());			 									 		
+				 		System.out.println("FetchTCSDetails TCS output from IDEA responseData::" + tcsResp.toString());
+				 		String decryptedData = encService.decrypt(responseData, signature, plainAesByte, lrsTcsParamHm);//"{\"data\":\"{\\\"requestId\\\":\\\"270040901800255751\\\",\\\"responseTime\\\":\\\"27-09-202316:25:26\\\",\\\"panNo\\\":\\\"DTAPK2764K\\\",\\\"status\\\":0,\\\"revarsalAmount\\\":70.0}\",\"sign\":\"\",\"encAesKey\":\"\",\"plainAesKey\":null,\"success\":true,\"error\":\"\"}";//encService.decrypt(responseData, signature, plainAesByte, lrsTcsParamHm);
+				 		logger.info("FetchTCSDetails TCS output from IDEA decryptedData::" + decryptedData);
+				 		
+				 		model.setResponse(decryptedData);
+				 		flywireLRSReturnDao.updateLRSResponse(model);
+				 		logger.info("before object mapper...");
+				 		ObjectMapper mapp=new ObjectMapper();
+				 		
+				 		
+				 		HashMap m = mapp.readValue(decryptedData, HashMap.class);
+				 		logger.info("map value :"+m);
+		 				//JSONObject decryptedResp = new JSONObject(decryptedData);
+		 				String finalDecryptedData =  (String) m.get("data");
+		 				
+		 				
+		 				
+		 				logger.info("finalDecryptedData::" + finalDecryptedData);
+				 		
+		 				
+		 				RCLTSDecResponse rcltsDecResp = gson.fromJson(finalDecryptedData, RCLTSDecResponse.class);
+		 				
+		 				logger.info("FetchTCSDetails TCS output from IDEA Success::" + rcltsDecResp.toString());
+		 				
+		 				//if(rcltsDecResp.getStatus() == 0){
+		 					logger.info("Response received from TCS is success for Flywire Return for Txn ID "+model.getTransId());
+		 					
+		 					//Updating LRS_RETURN flag in Flywire table as N
+		 					flywireLRSReturnDao.updateStatusInTxnTable(rcltsDecResp.getStatus(),model.getTransId(),model.getResponse());
+		 				//}else{
+		 					logger.info("Response received from TCS is Failure for Flywire Return "+model.getTransId());
+		 				//}
+		 					
+		 				}
+		 			}catch(Exception e1){
+		 				logger.info("exception in utility ::"+e1.getMessage());
+		 			}
+				 	}
+				
+	   			}
+			
+		}catch(Exception ex){
+			logger.info("Exception in second try.."+ex);
+		}
+		}catch(Exception e){
+			logger.info("Exception in first try.."+e);
+		}
+	}
+
+	public HashMap<String, String> encyAlgoMapping() {
+		HashMap<String,String> lrsTcsParamHm = new HashMap<String,String>();
+		
+		String realPath = servletContext.getRealPath("/WEB-INF/lrsTcsApi/");
+		//String realPath = servletContext.getRealPath("lrsTcsApi"); //TO_CHECK
+		String lrsFilePath =realPath;//+"/WEB-INF/lrsTcsApi/";
+		 logger.info("context path : "+lrsFilePath);
+		//urlPath.load(new FileInputStream(realPath+"/WEB-INF/config/applicationconfig.properties"));
+		String jks = env.getRequiredProperty("jks");
+		String pass= env.getRequiredProperty("pass");
+		String enc_data_pub_alias= env.getRequiredProperty("enc_data_pub_alias");
+		String dec_sign_pub_alias= env.getRequiredProperty("dec_sign_pub_alias");
+		
+		//algo
+		lrsTcsParamHm.put("rsa_algo", "RSA/ECB/OAEPPadding");
+		lrsTcsParamHm.put("aes_algo", "AES/CBC/PKCS5Padding");
+		lrsTcsParamHm.put("sign_algo", "SHA256withRSA");
+		lrsTcsParamHm.put("pbe_algo", "PBEWithMD5AndDES");
+		lrsTcsParamHm.put("aes_key_size", "256");
+		//enc_data
+		lrsTcsParamHm.put("enc_data_pub_jks", lrsFilePath + jks);
+		lrsTcsParamHm.put("enc_data_pub_jks_pass", pass);
+		lrsTcsParamHm.put("enc_data_pub_alias", enc_data_pub_alias);
+		//enc_sign
+		lrsTcsParamHm.put("enc_sign_pvt_jks", lrsFilePath + jks);
+		lrsTcsParamHm.put("enc_sign_pvt_jks_pass", pass);
+		lrsTcsParamHm.put("enc_sign_pvt_alias", "glsfxoutuat");
+		//enc_sign_pvt_pass
+		lrsTcsParamHm.put("enc_sign_pvt_pass", pass);
+		//dec_sign
+		lrsTcsParamHm.put("dec_sign_pub_jks", lrsFilePath + jks);
+		lrsTcsParamHm.put("dec_sign_pub_alias", dec_sign_pub_alias);
+		lrsTcsParamHm.put("dec_sign_pub_jks_pass", pass);
+		logger.info("FetchTCSDetails Params11  : "+lrsFilePath);	
+		return lrsTcsParamHm;
+	}
+
+	private String getKycSequenceNo() {
+		logger.info("FlywireLRSReturnServiceImpl.getKycSequenceNo()");
+		return flywireLRSReturnDao.getKycSequenceNo();
+	}
+
+	public void generateLRSReturnRequest(List<FlywireLRSReturnModel> fetchRecords) {
+		
+		
+		logger.debug("FlywireLRSReturnServiceImpl::generateLRSReturnRequest METHOD BEGIN");
+		Iterator iter = fetchRecords.iterator();
+		
+		while(iter.hasNext()){
+			
+			logger.debug("Iterating over LRS Return Ref list");
+			
+			FlywireLRSReturnModel model = (FlywireLRSReturnModel)iter.next();
+			
+			logger.debug("LRS Token ID is "+model.getTokenId()+" Request ID is "+model.getRequestId()+" Source System is "+model.getSrcSystem());
+			logger.debug("Request time is "+model.getRequestTime()+" Transaction ID is "+model.getTransId()+" PAN no is "+model.getPanNo());
+			
+			String flywireLRSReturnReq = null;
+					
+			
+			//String branch_no = (String)session.getAttribute("branchNumber");
+			
+	   		//Hit Service
+	   			   		
+			String source_id = "FXOUT";		
+			
+			DateTimeFormatter dtf = DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss.SS");
+			LocalDateTime now = LocalDateTime.now();
+			String format = dtf.format(now);
+			 
+				
+			try{
+				model.setTransId(model.getRefNo());
+				flywireLRSReturnReq = new String(
+						"{"
+								+"\"tokenId\":"+"\""+model.getTokenId()+"\""
+								/*+","+"\"requestId\":"+"\""+requestId+"\""
+								+","+"\"srcSystem\":"+"\""+"FXOUT"+"\""*/
+								+","+"\"requestTime\":"+"\""+format+"\""
+								/*+","+"\"transId\":"+"\""+""+"\""
+								+","+"\"panNo\":"+"\""+model.getPanNo()+"\""*/
+						+"}"
+						);
+				
+				logger.debug("Request string is for generateLRSReturnRequest :" + flywireLRSReturnReq);
+				int rowCount=0;
+				
+				if(model.getTokenId()!=null){
+				 rowCount = flywireLRSReturnDao.insertInAPIRequestTable(flywireLRSReturnReq,model.getTransId());
+				}
+				if(rowCount>0){
+					logger.debug("Updating LRS_RETURN column to N for reference no "+model.getTransId()+" to Y as request is sent");
+					int rowUpdated = flywireLRSReturnDao.UpdateLRSReturnStatus(model.getTransId());
+				}
+				
+			}catch(Exception ex){
+				logger.debug("Exception in generateLRSReturnRequest method "+ex.getMessage());
+				
+			}
+			
+			
+		}
+	}
+	
+	
+	
+	
+	
+	
+	public void sendTxnInfoToLrsTcsConfirmation() {
+	// TODO Auto-generated method stub
+		
+	logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation method Begin --------------");
+	
+	List<LrsTcsConfirmationReq> lrsConfirmlist=flywireLRSReturnDao.fetchRecordsForLrsTcsConfirmation(StringConstant.REM_TO_TCS_POSTED, StringConstant.PENDING);
+	
+	
+	if(null != lrsConfirmlist && lrsConfirmlist.size()>0){
+		
+		logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation lrsConfirmlist size "+lrsConfirmlist.size());
+					
+		for (LrsTcsConfirmationReq lrsReq : lrsConfirmlist) {
+
+			logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation for TxnRef No "
+					+ lrsReq.getTransId());
+			try {
+				boolean ofacCheck=false;
+				lrsReq.setSrcSystem(StringConstant.SRC_SYSTEM);
+				
+				Calendar calendar = Calendar.getInstance();
+				int mydayvar = calendar.get(Calendar.DAY_OF_YEAR);
+				DateFormat df1 = new SimpleDateFormat("hhMMsss");
+				String time = df1.format(Calendar.getInstance().getTime());
+				
+				DateTimeFormatter dtf = DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss.SS");
+				LocalDateTime now = LocalDateTime.now();
+				String format = dtf.format(now);
+				
+				
+				String s1 = "" + StringUtils.leftPad(Integer.toString(mydayvar),3,"0")+""+time;
+				  String requestId = s1 + getKycSequenceNo();
+				  
+				 
+				  
+				  lrsReq.setRequestId(requestId);
+				  logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation Req1uest Id "+ lrsReq.getRequestId());
+				  
+//				  prepareLrsConfirmApiReq(lrseq);
+				  
+
+				Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+
+				String tcsReqParamsJsonStr = gson.toJson(lrsReq);
+				logger.info(
+						"FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirmation JSON Request "
+								+ tcsReqParamsJsonStr);
+				CryptoService encService = CryptoServiceImpl.getInstance();
+				HashMap<String, String> lrsTcsParamHm = encyAlgoMapping();
+				String encryptedData = encService.encrypt(tcsReqParamsJsonStr, lrsTcsParamHm);
+				
+				
+				logger.info(
+						"FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirmation encryptedData ::"
+								+ encryptedData);
+				
+				if (encryptedData != null) {
+					logger.info(
+							"FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirmation encryptedData Request "
+									+ encryptedData);
+					EncryptedData encryptedRequest = gson.fromJson(encryptedData, EncryptedData.class);
+					logger.info(
+							"FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirmation encryptedRequest JSON ::"
+									+ encryptedRequest.toString());
+
+					if (encryptedRequest.isSuccess()) {
+						String encAesKey = encryptedRequest.getEncAesKey();
+						byte[] plainAesByte = encryptedRequest.getPlainAesKey(); 
+						
+						RESTUtility restUtility = new RESTUtility();
+						String lrsTcsConfirmUrl = env.getRequiredProperty("idea_tcs_confirm_url");
+						
+                      
+						
+						String finalTcsRequest = new String(""
+		 						+ "{\"requestId\":\""+requestId+"\","
+		 						+ "\"srcSystem\":\""+lrsReq.getSrcSystem()+"\","				 						
+		 						+ "\"requestedData\":\""+ encryptedRequest.getData()+"\","
+		 						+ "\"signature\":\""+encryptedRequest.getSign() +"\"}"
+		 						);
+						
+						
+						lrsReq.setLrsConfirmReq(finalTcsRequest + 
+				 			"{\"encAesKey\":\""+encAesKey+"\"\","
+				 			+"\"plainReq\":\""+tcsReqParamsJsonStr+"\"}");
+						
+						
+						lrsReq.setReqStatus(StringConstant.PENDING);
+						lrsReq.setReqType(StringConstant.LRS_CONFIRMATION);
+						
+						flywireLRSReturnDao.insertAndUpdateDbForConfirmationReq(lrsReq,StringConstant.PRESENT_STATUS);
+
+						logger.info(
+								"FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation : LrsTcsConfirmUrl API Call Begin "
+										+ lrsTcsConfirmUrl + "    Final Tcs ReqParamsJsonStr::::" + finalTcsRequest
+										+ "   encAesKey::::" + encAesKey);
+						String tcsReturnOutput=null;
+						try{
+
+						 tcsReturnOutput = restUtility.post(lrsTcsConfirmUrl, finalTcsRequest, encAesKey);
+						
+
+						logger.info(
+								"FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirm API Response  :: "
+										+ tcsReturnOutput);
+						}catch(SocketTimeoutException se){
+							logger.info("LRS Confirm SocketTimeoutException ::"+se.getMessage()+" For Ref No : "+lrsReq.getTransId());
+							tcsReturnOutput=StringConstant.LRS_Socket_Timeout;
+						}
+						catch (Exception e) 
+						{
+							logger.info("Exception in LRS Confirm::"+e.getMessage()+" For Ref No : "+lrsReq.getTransId());
+							lrsReq.setResponse(e.getMessage());
+		 					lrsReq.setReqStatus(StringConstant.FAIL);
+		 					flywireLRSReturnDao.UpdateDbForLrsConfirmationResponse(lrsReq,tcsReturnOutput,StringConstant.PENDING,"01");
+							
+						}
+						
+						
+					 	if(tcsReturnOutput != null &&!tcsReturnOutput.equalsIgnoreCase(StringConstant.LRS_Socket_Timeout))
+					 	{
+					 		RCLTSEncResponse tcsResp = gson.fromJson(tcsReturnOutput, RCLTSEncResponse.class);
+					 		String responseData = tcsResp.getResponseData();
+					 		String signature = tcsResp.getSignature();
+					 		logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation  responseData::" + tcsResp.toString());			 									 		
+					 		String decryptedData = encService.decrypt(responseData, signature, plainAesByte, lrsTcsParamHm);
+					 		logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation decrypted  responseData::" + decryptedData);	
+					 		lrsReq.setResponse(decryptedData);
+					 	
+					 		
+					 		logger.info("before object mapper...");
+					 		ObjectMapper mapp=new ObjectMapper();
+					 		
+					 		
+					 		HashMap m = mapp.readValue(decryptedData, HashMap.class);
+					 		logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation map value :"+m);
+
+					 		String finalDecryptedData =  (String) m.get("data");
+			 				
+			 				lrsReq.setResponse(finalDecryptedData);
+			 				
+			 				logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation finalDecryptedData::" + finalDecryptedData);
+					 		
+			 				
+			 				RCLTSDecResponse rcltsDecResp = gson.fromJson(finalDecryptedData, RCLTSDecResponse.class);
+			 				
+			 				logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirm API Success Response:: " + rcltsDecResp.toString());
+			 				
+			 					logger.info("Response received LrsTcsConfirm API is success for Flywire Return for Txn ID "+lrsReq.getTransId());
+			 					
+			 					String custPresentStatus="";
+			 					String status="";
+			 					if(rcltsDecResp.getStatus()==0){
+			 						custPresentStatus=StringConstant.WAIT_P_CRED;
+			 						status=StringConstant.L1_APPROVED;
+			 						lrsReq.setReqStatus(StringConstant.SUCCESS);
+			 						ofacCheck=true;
+			 						logger.info("Response received from TCS is Success for Flywire TCS Confirm "+lrsReq.getTransId());
+			 					}else if(rcltsDecResp.getStatus()==1 && rcltsDecResp.getErrorMsg().equalsIgnoreCase("The transaction is already finalized") ){
+			 						custPresentStatus=StringConstant.WAIT_P_CRED;
+			 						status=StringConstant.L1_APPROVED;
+			 						lrsReq.setReqStatus(StringConstant.SUCCESS);
+			 						ofacCheck=true;
+			 						logger.info("Response received from TCS is The transaction is already finalized for Flywire TCS Confirm "+lrsReq.getTransId());
+			 					}
+			 					else{
+			 						custPresentStatus=StringConstant.PRESENT_STATUS_FAIL;
+			 						status = StringConstant.PENDING;
+			 						lrsReq.setReqStatus(StringConstant.FAIL);
+			 						ofacCheck=false;
+			 						logger.info("Response received from TCS is Failure for Flywire TCS Confirm "+lrsReq.getTransId());
+			 					}
+			 					
+			 					flywireLRSReturnDao.UpdateDbForLrsConfirmationResponse(lrsReq,custPresentStatus,status,Integer.toString(rcltsDecResp.getStatus()));
+			 					
+			 					
+			 					try{
+			 						logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirm   ofacCheck bol value "+ofacCheck+ " Ref No " +lrsReq.getTransId());
+
+				 					if(ofacCheck){
+				 						logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirm inserting data into FXOUT_TEST_STATUS for ofacCheck Ref No " +lrsReq.getTransId());
+				 					
+//				 						 String txnRef= flywireLRSReturnDao.getTxnRefNoForFlywire();
+				 						 String txnRef= lrsReq.getTransId();
+				 						 
+				 						logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirm FXOUT_TEST_STATUS insertion Refrence No " +txnRef);
+				 						 
+				 						Object[] params = {txnRef, StringConstant.fLY_VAID_WORK_FLOW_ID};
+				 						
+				 						int recInsCnt=flywireLRSReturnDao.insertFlywireWorkflowIntoTestStatus(params);
+				 						logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirm data inserted succesfully into FXOUT_TEST_STATUS for ofacCheck Ref No " +lrsReq.getTransId()+" Test Count "+recInsCnt);
+				 						
+				 						Object[] updateParams = {txnRef};
+				 						recInsCnt=0;
+				 						logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirm  FXOUT_TEST_STATUS updation for ofacCheck Ref No " +lrsReq.getTransId());
+				 						logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirm FXOUT_TEST_STATUS updation Refrence No " +txnRef);
+				 						recInsCnt=flywireLRSReturnDao.updateFlywireTestStatus(updateParams);
+				 						logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirm  FXOUT_TEST_STATUS update completed for ofacCheck Ref No " +lrsReq.getTransId()+" Test Count "+recInsCnt);
+				 					
+				 					}
+			 					}catch(Exception ex){
+			 						logger.info("Exception in FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation LrsTcsConfirm ofacCheck FXOUT_TEST_STATUS for Refrence No " +lrsReq.getTransId()+" Exception :"+ex.getMessage());
+			 					}
+			 					
+
+			 					
+			 				}else if(tcsReturnOutput.equalsIgnoreCase(StringConstant.LRS_Socket_Timeout)){
+			 					lrsReq.setResponse(tcsReturnOutput);
+			 					lrsReq.setReqStatus(tcsReturnOutput);
+			 					flywireLRSReturnDao.UpdateDbForLrsConfirmationResponse(lrsReq,tcsReturnOutput,StringConstant.PENDING,"01");
+			 				}
+
+					}
+				}
+			} catch (Exception ex) {
+				logger.info("Exception in FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation method :: "
+						+ ex.getMessage());
+				ex.printStackTrace();
+			}
+
+		}
+		
+	}
+	
+	logger.info("FlywireLRSReturnServiceImpl :: sendTxnInfoToLrsTcsConfirmation method End --------------");
+	}
+	
+
+}
+ class RESTUtility 
+{
+	Logger logger =LogManager.getLogger(RESTUtility.class);
+	public RESTUtility(){
+		logger.info("Constructor called....");
+	}
+	public String post(String apiUrl, String data, String secretKey) throws SocketTimeoutException,Exception
+	{String result = null;
+//		try{
+		logger.info("RESTUtility post() started");
+		
+		//OkHttpClient client = new OkHttpClient();
+		OkHttpClient client = new OkHttpClient.Builder().readTimeout(10,TimeUnit.SECONDS).connectTimeout(62, TimeUnit.SECONDS).build();
+		MediaType mediaType = MediaType.parse("application/json");
+		RequestBody body = RequestBody.create(mediaType, data);
+		
+		Request requests = new Request.Builder()
+				.url(apiUrl).post(body)
+				.addHeader("content-type", "application/json")
+				.addHeader("accept", "application/json")
+				.addHeader("AccessToken", secretKey)
+				.build();
+//		try 
+//		{
+			logger.info("Before Call!! API URL "+apiUrl+"::POSTBody::"+body);
+			System.out.println("Before Client New Call!!");
+			Response response = client.newCall(requests).execute();
+			System.out.println("After Client New Call!!");
+			logger.info("After Call!! API URL "+apiUrl+"::POSTBody::"+response.body());
+			ResponseBody responseBody = response.body();	
+			
+			if(response.isSuccessful()) 
+			{	
+				if (responseBody != null) 
+				{
+					result = response.body().string();
+					logger.info("After Call!! API URL "+apiUrl+"::Response Body::"+result);
+				}
+			}
+		logger.info("RESTUtility post() Ended");
+		return result;
+	}
+	
+	int proxyPort = 8080;
+	String proxyHost = "proxyHost";
+	final String username = "username";
+	final String password = "password";
+
+	Authenticator proxyAuthenticator = new Authenticator() {
+	  @Override public Request authenticate(Route route, Response response) throws IOException {
+	       String credential = Credentials.basic(username, password);
+	       return response.request().newBuilder()
+	           .header("Proxy-Authorization", credential)
+	           .build();
+	  }
+
+	
+	};
+
+	OkHttpClient client = new OkHttpClient.Builder()
+	    .connectTimeout(60, TimeUnit.SECONDS)
+	    .writeTimeout(60, TimeUnit.SECONDS)
+	    .readTimeout(60, TimeUnit.SECONDS)
+	    .proxy(new Proxy(Proxy.Type.HTTP, new InetSocketAddress(proxyHost, proxyPort)))
+	    .proxyAuthenticator(proxyAuthenticator)
+	    .build();
+
+
+}
+
+package com.sbi.fxout.dao;
+
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.apache.logging.log4j.LogManager;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.BeanPropertyRowMapper;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.stereotype.Repository;
+
+import com.sbi.fxout.model.FlywireLRSReturnModel;
+import com.sbi.fxout.model.FxoutMercuryModel;
+import com.sbi.fxout.model.LrsTcsConfirmationReq;
+import com.sbi.fxout.utility.StringConstant;
+@Repository
+public class FlywireLRSReturnDaoImpl implements FlywireLRSReturnDao {
+	
+	public final static org.apache.logging.log4j.Logger logger =  LogManager.getLogger(FxoutMercuryWriterDaoImpl.class);
+	
+	
+	
+	@Autowired
+	private JdbcTemplate jdbcTemplate;
+	
+	
+	
+	@Autowired
+	FlywireLRSReturnDao flywireLRSReturnDao;
+
+	@Override
+	public List<FlywireLRSReturnModel> fetchRecords() {
+		
+		logger.debug("fetchRecords in FlywireLRSReturnDaoImpl METHOD BEGIN");
+		List<FlywireLRSReturnModel> refList = null;
+		
+		try{
+		 refList = jdbcTemplate.query(SQLConstants.FETCH_RECORDS_FOR_LRS_RETURN,new ModelVal());
+		logger.debug("fetchRecords list size is :: "+refList.size());
+		}catch(Exception ex){
+			logger.debug("Exception occoured for fetchRecords in FlywireLRSReturnDaoImpl "+ex.getMessage());
+		}
+		
+		logger.debug("fetchRecords in FlywireLRSReturnDaoImpl METHOD END");
+		return refList;
+	}
+	class ModelVal implements RowMapper<FlywireLRSReturnModel> {
+
+		@Override
+		public FlywireLRSReturnModel mapRow(ResultSet rs, int arg1) throws SQLException {
+ 
+			FlywireLRSReturnModel model = new FlywireLRSReturnModel();
+			
+
+			model.setRefNo(rs.getString("txn_ref_no"));
+		model.setTokenId(rs.getString("LRS_TOKEN_ID"));
+			model.setPanNo(rs.getString("rem_pan_no"));
+			
+			return model;
+		}
+
+	}
+
+	@Override
+	public int insertInAPIRequestTable(String flywireLRSReturnReq,String refNo) {
+		
+		logger.debug("FlywireLRSReturnDaoImpl :: insertInAPIRequestTable METHOD BEGIN");
+		int rowsInserted = 0;
+		
+		try{
+		
+		Object[] params = {refNo,"LRS_RETURN",flywireLRSReturnReq, "PENDING"};
+		
+		rowsInserted = jdbcTemplate.update(SQLConstants.INSERT_LRS_API_REQUEST, params);
+		logger.debug("Row inserted for insertInAPIRequestTable is :: "+rowsInserted+" for reference number :: "+refNo);
+		
+		}catch(Exception ex){
+			logger.debug("Exception occoured in FlywireLRSReturnDaoImpl :: insertInAPIRequestTable "+ex.getMessage());
+		}
+		
+		return rowsInserted;
+	}
+
+	@Override
+	public int UpdateLRSReturnStatus(String transId) {
+		logger.debug("FlywireLRSReturnDaoImpl :: UpdateLRSReturnStatus METHOD BEGIN");
+		int rowsUpdated = 0;
+		
+		try{
+			
+			Object[] params = {"Y",transId};
+			
+			rowsUpdated = jdbcTemplate.update(SQLConstants.UPDATE_STATUS_LRS_API_REQUEST, params);
+			logger.debug("Row updated for LRS Return status are :: "+rowsUpdated+" for reference number :: "+transId);
+			
+			
+		}catch(Exception ex){
+			logger.debug("Exception occoured in FlywireLRSReturnDaoImpl :: UpdateLRSReturnStatus "+ex.getMessage());
+			
+		}
+		
+		
+		return rowsUpdated;
+	}
+
+	@Override
+	public List<FlywireLRSReturnModel> fetchLRSReturnReqRecords() {
+        
+		logger.debug("FlywireLRSReturnDaoImpl:: fetchLRSReturnReqRecords METHOD BEGIN");
+		List refList = null;
+		
+		try{
+			Object[] params={"PENDING","LRS_RETURN"};
+		 refList = jdbcTemplate.query(SQLConstants.FETCH_RECORDS_FOR_LRS_RETURN_API_REQUEST,params,new ModelVal1());
+		logger.debug("fetchLRSReturnReqRecords list size is :: "+refList.size());
+		}catch(Exception ex){
+			logger.debug("Exception occoured for fetchRecords in FlywireLRSReturnDaoImpl "+ex.getMessage());
+		}
+		
+		logger.debug("fetchRecords in FlywireLRSReturnDaoImpl METHOD END");
+		return refList;
+
+	}
+class ModelVal1 implements RowMapper{
+
+	@Override
+	public Object mapRow(ResultSet rs, int arg1) throws SQLException {
+		FlywireLRSReturnModel model = new FlywireLRSReturnModel();
+		
+
+		model.setRefNo(rs.getString("ref_no"));
+	
+		model.setRequest(rs.getString("request"));
+		
+		return model;
+	}
+	
+}
+	@Override
+	public void updateMercuryReqRes(FlywireLRSReturnModel model, String response) {
+		
+		if ("0".equalsIgnoreCase(model.getStatus_code().trim())) {
+			model.setStatus("success");
+					} 
+		else{
+			model.setStatus("failure");
+		}
+		
+		
+	}
+
+	@Override
+	public String getKycSequenceNo() {
+		logger.info("FlywireLRSReturnDaoImpl.getKycSequenceNo()  Started");
+		 return (String)jdbcTemplate.queryForObject(SQLConstants.GET_KYC_SEQUENCE, String.class);
+	}
+
+	@Override
+	public void insertLRSReturnRequest(FlywireLRSReturnModel model) {
+		
+		Object[] params={model.getRequestId(),model.getRequestType(),model.getRequest()};
+		int rowsInserted = jdbcTemplate.update(SQLConstants.LRS_RETURN_REQ_INSERTION,params);
+		logger.debug("Rows inserted for reference no "+model.getTransId()+ " are :: "+rowsInserted);
+		
+		
+	}
+
+	@Override
+	public void updateLRSResponse(FlywireLRSReturnModel model) {
+		Object[] params={model.getResponse(),model.getRequestId()};
+		int rowsUpdated = jdbcTemplate.update(SQLConstants.FXOUT_RETURN_RES_UPDATION,params);
+		logger.debug("Rows updated for reference no "+model.getTransId()+ " are :: "+rowsUpdated);
+		
+	}
+
+	@Override
+	public void updateStatusInTxnTable(Integer status,String refNo,String response) {
+		logger.info("updateStatusInTxnTable(Integer status,String refNo)");
+		
+		int rowsUpdated1 =0;
+		int rowsUpdated2=0;
+		logger.debug("status :"+status+"   refNo  ::"+refNo);
+		
+		if(status==0){
+			
+			Object[] params1={"Lrs_Done",response,refNo};
+			Object[] params2={"Lrs_Done",refNo};
+		 rowsUpdated1 = jdbcTemplate.update(SQLConstants.FXOUT_RETURN_RESP_UPDATE_TXN_TABLE,params2);
+		
+		 rowsUpdated2 = jdbcTemplate.update(SQLConstants.FXOUT_RETURN_MERCURY_UPDATE_TXN_TABLE,params1);
+		}
+		else{
+			Object[] params1={"Lrs_Fail",response,refNo};
+			Object[] params2={"Lrs_Fail",refNo};
+			 rowsUpdated1 = jdbcTemplate.update(SQLConstants.FXOUT_RETURN_RESP_UPDATE_TXN_TABLE,params2);
+				
+			 rowsUpdated2 = jdbcTemplate.update(SQLConstants.FXOUT_RETURN_MERCURY_UPDATE_TXN_TABLE,params1);
+		}
+		
+		logger.debug("Rows updated for reference no "+refNo+ " are :: "+rowsUpdated1);
+		
+		
+	}
+	
+	
+//	@Override
+	public List<LrsTcsConfirmationReq> fetchRecordsForLrsTcsConfirmation(String presentStatus,String status) {
+		
+		logger.debug("FlywireLRSReturnDaoImpl :: fetchRecordsForLrsTcsConfirmation METHOD BEGIN");
+		
+		List<LrsTcsConfirmationReq> refList =null;
+		Object[] params={presentStatus,status};
+		logger.debug("FlywireLRSReturnDaoImpl :: fetchRecordsForLrsTcsConfirmation DB params "+params[0]+" 2nd param "+params[1]);
+		
+		try{
+		 refList = jdbcTemplate.query(SQLConstants.FETCH_RECORDS_FOR_LRS_TCS_CONFIRMATION,params,new LrsTcsConfirmationMapping());
+		 
+		 logger.debug("fetched Records For LrsTcsConfirmation from Db list size is :: "+refList);
+		 
+			for (LrsTcsConfirmationReq data : refList) {
+				try{
+
+				Object[] paramsUpdate = { presentStatus.concat("_PICKED"), status, data.getTransId(), status };
+
+				int rowsInserted = jdbcTemplate.update(SQLConstants.UPDATE_STATUS_FOR_LRS_TCS_CONFIRMATION,
+						paramsUpdate);
+				logger.debug("Row updated for FLYWIRE_CUSTOMER_PAYMENT Table is :: " + rowsInserted
+						+ " for reference number :: " + data.getTransId());
+			}
+			catch(Exception ex){
+				logger.debug("Exception occoured in update FlywireLRSReturnDaoImpl :: fetchRecordsForLrsTcsConfirmation METHOD "+ex.getMessage()+" Query triggerd "+SQLConstants.UPDATE_STATUS_FOR_LRS_TCS_CONFIRMATION+" for Ref No :"+data.getTransId());
+
+			}
+			}
+		 
+		}catch(Exception ex){
+			logger.debug("Exception occoured FlywireLRSReturnDaoImpl :: fetchRecordsForLrsTcsConfirmation METHOD "+ex.getMessage()+" Query triggerd "+SQLConstants.FETCH_RECORDS_FOR_LRS_TCS_CONFIRMATION);
+//			ex.printStackTrace();
+		}
+		
+		logger.debug("FlywireLRSReturnDaoImpl :: fetchRecordsForLrsTcsConfirmation METHOD END  Query triggerd "+SQLConstants.FETCH_RECORDS_FOR_LRS_TCS_CONFIRMATION);
+		return refList;
+	}
+	
+	class LrsTcsConfirmationMapping implements RowMapper{
+
+		@Override
+		public Object mapRow(ResultSet rs, int arg1) throws SQLException {
+			logger.debug("FlywireLRSReturnDaoImpl :: LrsTcsConfirmationMapping row mapper METHOD BEGIN");
+			LrsTcsConfirmationReq model = new LrsTcsConfirmationReq();
+			
+			model.setTokenId(Integer.parseInt((rs.getString("tokenId"))));
+			model.setRequestTime(rs.getString("requestTime"));
+			model.setTransId(rs.getString("transId"));
+			model.setTrnAmount(rs.getString("trnAmount"));
+			model.setOrgCurCode(rs.getString("orgCurCode"));
+			model.setTrnDate(rs.getString("trnDate"));
+			model.setValDate(rs.getString("valDate"));
+			model.setCifNo(rs.getString("cifNo"));
+			model.setAccNo(rs.getString("accNo"));
+			model.setCntryCode(rs.getString("cntryCode"));
+			model.setCustName(rs.getString("custName"));
+			logger.debug("FlywireLRSReturnDaoImpl :: LrsTcsConfirmationMapping row mapper METHOD End");
+			return model;
+		}
+		
+	}
+	
+	
+	public void insertAndUpdateDbForConfirmationReq(LrsTcsConfirmationReq confirmationReq,String custpayStatus){
+
+		
+		logger.debug("FlywireLRSReturnDaoImpl :: insertAndUpdateDbForConfirmationReq METHOD BEGIN");
+		int rowsInserted = 0;
+		
+		try {
+			Object[] paramsUpdate = { custpayStatus,confirmationReq.getReqStatus(), confirmationReq.getTransId(), confirmationReq.getReqStatus() };
+
+
+			rowsInserted = jdbcTemplate.update(SQLConstants.UPDATE_STATUS_FOR_LRS_TCS_CONFIRMATION, paramsUpdate);
+			logger.debug("Row updated for FLYWIRE_CUSTOMER_PAYMENT Table is :: " + rowsInserted + " for reference number :: "
+					+ confirmationReq.getTransId());
+
+			rowsInserted = 0;
+			
+			Object[] params = { confirmationReq.getTransId(), confirmationReq.getReqType(),
+					confirmationReq.getLrsConfirmReq(), confirmationReq.getReqStatus() };
+
+			rowsInserted = jdbcTemplate.update(SQLConstants.INSERT_LRS_API_REQUEST, params);
+			logger.debug("Row inserted for insertInAPIRequestTable is :: " + rowsInserted + " for reference number :: "
+					+ confirmationReq.getTransId());
+
+		}catch(Exception ex){
+			logger.debug("Exception occoured in insertAndUpdateDbForConfirmationReq :: insertInAPIRequestTable "+ex.getMessage());
+		}	
+	
+		
+	}
+	
+	public void UpdateDbForLrsConfirmationResponse(LrsTcsConfirmationReq confirmationReq, String custpayStatus,String status,String responseCode) {
+
+		logger.debug("FlywireLRSReturnDaoImpl :: UpdateDbForLrsConfirmationResponse METHOD BEGIN");
+		int rowsInserted = 0;
+
+		try {
+			Object[] paramsUpdate = { custpayStatus,status, confirmationReq.getTransId(), StringConstant.PENDING };
+
+			rowsInserted = jdbcTemplate.update(SQLConstants.UPDATE_STATUS_FOR_LRS_TCS_CONFIRMATION, paramsUpdate);
+			logger.debug("Row updated for FLYWIRE_CUSTOMER_PAYMENT Table is :: " + rowsInserted
+					+ " for reference number :: " + confirmationReq.getTransId());
+
+			rowsInserted = 0;
+
+			Object[] params = { confirmationReq.getReqStatus(),confirmationReq.getResponse(),responseCode, confirmationReq.getTransId(), confirmationReq.getReqType()};
+
+			rowsInserted = jdbcTemplate.update(SQLConstants.UPDATE_LRS_API_REQUEST, params);
+			logger.debug("Row updated for UpdateDbForLrsConfirmationResponse is :: " + rowsInserted + " for reference number :: "
+					+ confirmationReq.getTransId());
+
+		} catch (Exception ex) {
+			logger.debug("Exception occoured in UpdateDbForLrsConfirmationResponse :: updated "
+					+ ex.getMessage());
+		}
+
+	}
+	
+	@Override
+	public String getTxnRefNoForFlywire() throws SQLException {
+		return (String) jdbcTemplate.queryForObject(SQLConstants.GET_TRANS_SEQ_NUMBER_For_Flywire, String.class);
+	}
+	
+	@Override
+	public int insertFlywireWorkflowIntoTestStatus(Object[] params) throws SQLException {
+		logger.debug("FlywireLRSReturnDaoImpl :: insertFlywireWorkflowIntoTestStatus METHOD BEGIN work flow id "+params[1]+" and REFERENCE_NO "+params[0]);
+		return jdbcTemplate.update(SQLConstants.INSERT_INTO_FLYWIRE_FXOUT_TEST_STATUS, params);
+	}
+	
+	
+	@Override
+	public int updateFlywireTestStatus(Object[] params) throws SQLException {
+		return jdbcTemplate.update(SQLConstants.UPDATE_FLYWIRE_START_STEP_INTO_TEST_STATUS, params);
+
+	}
+
+}
+
+
+package com.sbi.fxout.utility;
+
+public interface StringConstant {
+	
+	public static final String REM_TO_TCS_POSTED="REM_TO_TCS_POSTED";
+	public static final String PENDING="pending";
+	public static final String LRS_CONFIRMATION="LRS_CONFIRMATION";
+	public static final String PRESENT_STATUS="Lrs_Confirm_inprocess";
+	public static final String SRC_SYSTEM="FLYRE";
+	public static final String WAIT_P_CRED="wait_p_cred";
+	public static final String PRESENT_STATUS_FAIL="Lrs_Confirm_Failure";
+	public static final String L1_APPROVED="l1_approved";
+	public static final String SUCCESS="success";
+	public static final String FAIL="failure";
+	public static final String fLY_VAID_WORK_FLOW_ID="flywire_validation";
+	public static final String LRS_Socket_Timeout="LRS_Socket_Timeout";
+
+}
+
+package com.sbi.fxout.model;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+public class LrsTcsResp{
+    @JsonProperty("requestId")
+    String requestId;
+    @JsonProperty("responseTime") 
+    String responseTime;
+    @JsonProperty("tokenId") 
+    int tokenId;
+    @JsonProperty("panNo") 
+    String panNo;
+    @JsonProperty("status") 
+    int status;
+    @JsonProperty("rrorMsg")
+    String rrorMsg;
+    
+    public String getRequestId() { 
+		 return this.requestId; } 
+    public void setRequestId(String requestId) { 
+		 this.requestId = requestId; } 
+
+  
+    public String getResponseTime() { 
+		 return this.responseTime; } 
+    public void setResponseTime(String responseTime) { 
+		 this.responseTime = responseTime; } 
+  
+ 
+    public int getTokenId() { 
+		 return this.tokenId; } 
+    public void setTokenId(int tokenId) { 
+		 this.tokenId = tokenId; } 
+   
+   
+    public String getPanNo() { 
+		 return this.panNo; } 
+    public void setPanNo(String panNo) { 
+		 this.panNo = panNo; } 
+ 
+  
+    public int getStatus() { 
+		 return this.status; } 
+    public void setStatus(int status) { 
+		 this.status = status; } 
+    
+    @JsonProperty("rrorMsg") 
+    public String getRrorMsg() { 
+		 return this.rrorMsg; } 
+    public void setRrorMsg(String rrorMsg) { 
+		 this.rrorMsg = rrorMsg; } 
+  
+    @JsonProperty("csAmountRecorded") 
+    public int getCsAmountRecorded() { 
+		 return this.csAmountRecorded; } 
+    public void setCsAmountRecorded(int csAmountRecorded) { 
+		 this.csAmountRecorded = csAmountRecorded; } 
+    int csAmountRecorded;
+}
+
+
+package com.sbi.fxout.model;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+public class LrsTcsConfirmationReq{
+    @JsonProperty("tokenId") 
+    public int getTokenId() { 
+		 return this.tokenId; } 
+    public void setTokenId(int tokenId) { 
+		 this.tokenId = tokenId; } 
+    int tokenId;
+    @JsonProperty("requestId") 
+    public String getRequestId() { 
+		 return this.requestId; } 
+    public void setRequestId(String requestId) { 
+		 this.requestId = requestId; } 
+    String requestId;
+    @JsonProperty("srcSystem") 
+    public String getSrcSystem() { 
+		 return this.srcSystem; } 
+    public void setSrcSystem(String srcSystem) { 
+		 this.srcSystem = srcSystem; } 
+    String srcSystem;
+    @JsonProperty("requestTime") 
+    public String getRequestTime() { 
+		 return this.requestTime; } 
+    public void setRequestTime(String requestTime) { 
+		 this.requestTime = requestTime; } 
+    String requestTime;
+    @JsonProperty("transId") 
+    public String getTransId() { 
+		 return this.transId; } 
+    public void setTransId(String transId) { 
+		 this.transId = transId; } 
+    String transId;
+    @JsonProperty("branchCode") 
+    public String getBranchCode() { 
+		 return this.branchCode; } 
+    public void setBranchCode(String branchCode) { 
+		 this.branchCode = branchCode; } 
+    String branchCode;
+    @JsonProperty("panNo") 
+    public String getPanNo() { 
+		 return this.panNo; } 
+    public void setPanNo(String panNo) { 
+		 this.panNo = panNo; } 
+    String panNo;
+    @JsonProperty("purposeCode") 
+    public String getPurposeCode() { 
+		 return this.purposeCode; } 
+    public void setPurposeCode(String purposeCode) { 
+		 this.purposeCode = purposeCode; } 
+    String purposeCode;
+    @JsonProperty("usdEquivalent") 
+    public int getUsdEquivalent() { 
+		 return this.usdEquivalent; } 
+    public void setUsdEquivalent(int usdEquivalent) { 
+		 this.usdEquivalent = usdEquivalent; } 
+    int usdEquivalent;
+    @JsonProperty("inrEquivalent") 
+    public int getNrEquivalent() { 
+		 return this.inrEquivalent; } 
+    public void setNrEquivalent(int nrEquivalent) { 
+		 this.inrEquivalent = nrEquivalent; } 
+    int inrEquivalent;
+    @JsonProperty("isExempted") 
+    public String getIsExempted() { 
+		 return this.isExempted; } 
+    public void setIsExempted(String isExempted) { 
+		 this.isExempted = isExempted; } 
+    String isExempted;
+    @JsonProperty("inrAmountForExemptedTcs") 
+    public String getInrAmountForExemptedTcs() { 
+		 return this.inrAmountForExemptedTcs; } 
+    public void setInrAmountForExemptedTcs(String inrAmountForExemptedTcs) { 
+		 this.inrAmountForExemptedTcs = inrAmountForExemptedTcs; } 
+    String inrAmountForExemptedTcs;
+    @JsonProperty("subPurposeType") 
+    public String getSubPurposeType() { 
+		 return this.subPurposeType; } 
+    public void setSubPurposeType(String subPurposeType) { 
+		 this.subPurposeType = subPurposeType; } 
+    String subPurposeType;
+    @JsonProperty("taxCollected") 
+    public String getTaxCollected() { 
+		 return this.taxCollected; } 
+    public void setTaxCollected(String taxCollected) { 
+		 this.taxCollected = taxCollected; } 
+    String taxCollected;
+    @JsonProperty("trnAmount") 
+    public String getTrnAmount() { 
+		 return this.trnAmount; } 
+    public void setTrnAmount(String trnAmount) { 
+		 this.trnAmount = trnAmount; } 
+    String trnAmount;
+    @JsonProperty("orgCurCode") 
+    public String getOrgCurCode() { 
+		 return this.orgCurCode; } 
+    public void setOrgCurCode(String orgCurCode) { 
+		 this.orgCurCode = orgCurCode; } 
+    String orgCurCode;
+    @JsonProperty("trnDate") 
+    public String getTrnDate() { 
+		 return this.trnDate; } 
+    public void setTrnDate(String trnDate) { 
+		 this.trnDate = trnDate; } 
+    String trnDate;
+    @JsonProperty("valDate") 
+    public String getValDate() { 
+		 return this.valDate; } 
+    public void setValDate(String valDate) { 
+		 this.valDate = valDate; } 
+    String valDate;
+    @JsonProperty("cifNo") 
+    public String getCifNo() { 
+		 return this.cifNo; } 
+    public void setCifNo(String cifNo) { 
+		 this.cifNo = cifNo; } 
+    String cifNo;
+    @JsonProperty("accNo") 
+    public String getAccNo() { 
+		 return this.accNo; } 
+    public void setAccNo(String accNo) { 
+		 this.accNo = accNo; } 
+    String accNo;
+    @JsonProperty("cntryCode") 
+    public String getCntryCode() { 
+		 return this.cntryCode; } 
+    public void setCntryCode(String cntryCode) { 
+		 this.cntryCode = cntryCode; } 
+    String cntryCode;
+    @JsonProperty("custName") 
+    public String getCustName() { 
+		 return this.custName; } 
+    public void setCustName(String custName) { 
+		 this.custName = custName; } 
+    String custName;
+    @JsonProperty("rbiRefNo") 
+    public String getRbiRefNo() { 
+		 return this.rbiRefNo; } 
+    public void setRbiRefNo(String rbiRefNo) { 
+		 this.rbiRefNo = rbiRefNo; } 
+    String rbiRefNo;
+    @JsonProperty("rbiRefDate") 
+    public String getRbiRefDate() { 
+		 return this.rbiRefDate; } 
+    public void setRbiRefDate(String rbiRefDate) { 
+		 this.rbiRefDate = rbiRefDate; } 
+    String rbiRefDate;
+    @JsonProperty("tcsOverride") 
+    public String getTcsOverride() { 
+		 return this.tcsOverride; } 
+    public void setTcsOverride(String tcsOverride) { 
+		 this.tcsOverride = tcsOverride; } 
+    String tcsOverride;
+    @JsonProperty("tcsAmount") 
+    public int getTcsAmount() { 
+		 return this.tcsAmount; } 
+    public void setTcsAmount(int tcsAmount) { 
+		 this.tcsAmount = tcsAmount; } 
+    int tcsAmount;
+    
+    public String lrsConfirmReq;
+    public String reqStatus;
+    public String reqType;
+    public String response;
+    
+	public String getResponse() {
+		return response;
+	}
+	public void setResponse(String response) {
+		this.response = response;
+	}
+	public String getReqType() {
+		return reqType;
+	}
+	public void setReqType(String reqType) {
+		this.reqType = reqType;
+	}
+	public String getLrsConfirmReq() {
+		return lrsConfirmReq;
+	}
+	public void setLrsConfirmReq(String lrsConfirmReq) {
+		this.lrsConfirmReq = lrsConfirmReq;
+	}
+	public String getReqStatus() {
+		return reqStatus;
+	}
+	public void setReqStatus(String reqStatus) {
+		this.reqStatus = reqStatus;
+	}
+}
+
